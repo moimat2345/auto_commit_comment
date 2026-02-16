@@ -1,6 +1,5 @@
 use std::process::Command;
 use glob::glob;
-
 use std::fs;
 use std::io::{self, Write};
 
@@ -139,8 +138,13 @@ Store refresh tokens in encrypted cookie.
 fn cut_the_prompt(prompt: &str) -> (String, String) {
 	let mut lines = prompt.lines();
 	let title = lines.next().unwrap_or("").to_string();
-	lines.next(); // skip empty line
-	let body = lines.collect::<Vec<&str>>().join("\n");
+	// skip the empty line only if it's actually empty
+	let remaining: Vec<&str> = lines.collect();
+	let body = if remaining.first() == Some(&"") {
+		remaining[1..].join("\n")
+	} else {
+		remaining.join("\n")
+	};
 	(title, body)
 }
 
