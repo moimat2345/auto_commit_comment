@@ -201,6 +201,15 @@ async fn main() {
 	let commit_output = cmd.output().expect("Failed to execute git commit");
 	if commit_output.status.success() {
 		println!("Commit created successfully.");
+		let mut push_cmd = Command::new("git");
+		push_cmd.arg("push");
+		let push_output = push_cmd.output().expect("Failed to execute git push");
+		if push_output.status.success() {
+			println!("Changes pushed successfully.");
+		} else {
+			let stderr = String::from_utf8_lossy(&push_output.stderr);
+			eprintln!("Git push failed: {}", stderr);
+		}
 	} else {
 		let stderr = String::from_utf8_lossy(&commit_output.stderr);
 		eprintln!("Git commit failed: {}", stderr);
