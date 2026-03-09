@@ -3,12 +3,14 @@ use glob::glob;
 use std::fs;
 use std::io::{self, Write};
 
-async fn ask_claude(output: &str, api_key: &str) -> String {
+const MAX_CHUNK_CHARS: usize = 12_000;
+
+async fn call_claude(system: &str, user_message: &str, max_tokens: u32, api_key: &str) -> String {
     let body = serde_json::json!({
         "model": "claude-haiku-4-5-20251001",
-        "max_tokens": 512,
-        "system": "You generate git commit messages. Output ONLY the commit message. No markdown, no backticks.",
-        "messages": [{ "role": "user", "content": prepare_the_prompt(output) }]
+        "max_tokens": max_tokens,
+        "system": system,
+        "messages": [{ "role": "user", "content": user_message }]
     });
 
     let res: serde_json::Value = reqwest::Client::new()
@@ -28,6 +30,74 @@ async fn ask_claude(output: &str, api_key: &str) -> String {
             std::process::exit(1);
         }
     }
+}
+
+fn split_diff_into_chunks(diff: &str) -> Vec<String> {
+    if diff.len() <= MAX_CHUNK_CHARS {
+        return vec![diff.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_chunk = String::new();
+
+    for line in diff.lines() {
+        if current_chunk.len() + line.len() + 1 > MAX_CHUNK_CHARS && !current_chunk.is_empty() {
+            chunks.push(current_chunk);
+            current_chunk = String::new();
+        }
+        current_chunk.push_str(line);
+        current_chunk.push('\n');
+    }
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    chunks
+}
+
+async fn summarize_chunk(chunk: &str, chunk_index: usize, total_chunks: usize, api_key: &str) -> String {
+    let system = "You summarize git diffs. Be concise but preserve all important details: files changed, what was added/removed/modified, and why.";
+    let prompt = format!(
+        "Summarize this git diff (part {}/{}):\n\n{}",
+        chunk_index + 1,
+        total_chunks,
+        chunk
+    );
+    println!("  Summarizing chunk {}/{}...", chunk_index + 1, total_chunks);
+    call_claude(system, &prompt, 512, api_key).await
+}
+
+async fn generate_commit_message(context: &str, api_key: &str) -> String {
+    let system = "You generate git commit messages. Output ONLY the commit message. No markdown, no backticks.";
+    let prompt = format!(
+r#"You are a Git commit message generator.
+
+Analyze the following changes and generate a commit message.
+
+Rules:
+- First line: a short commit title using Conventional Commits format (feat:, fix:, refactor:, docs:, chore:, test:, style:, perf:)
+- Second line: empty
+- Third line onwards: a concise description of what changed and why (2-5 lines max)
+- Write in English
+- Be specific, not vague (no "updated files" or "various changes")
+- Focus on the WHY and WHAT, not the HOW
+
+Output format (strictly follow this, no extra text):
+<title>
+<empty line>
+<description>
+
+Example output:
+feat: add user authentication via OAuth2
+
+Implement Google OAuth2 login flow with token refresh.
+Add session middleware and protect /dashboard routes.
+Store refresh tokens in encrypted cookie.
+
+--- CHANGES ---
+{context}"#
+    );
+    call_claude(system, &prompt, 512, api_key).await
 }
 
 fn get_api_key() -> String {
@@ -102,37 +172,6 @@ fn get_all_the_readmes() -> Result<String, String> {
 	Ok(readmes)
 }
 
-fn prepare_the_prompt(output: &str) -> String {
-    format!(
-r#"You are a Git commit message generator.
-
-Analyze the following git diff and generate a commit message.
-
-Rules:
-- First line: a short commit title using Conventional Commits format (feat:, fix:, refactor:, docs:, chore:, test:, style:, perf:)
-- Second line: empty
-- Third line onwards: a concise description of what changed and why (2-5 lines max)
-- Write in English
-- Be specific, not vague (no "updated files" or "various changes")
-- Focus on the WHY and WHAT, not the HOW
-
-Output format (strictly follow this, no extra text):
-<title>
-<empty line>
-<description>
-
-Example output:
-feat: add user authentication via OAuth2
-
-Implement Google OAuth2 login flow with token refresh.
-Add session middleware and protect /dashboard routes.
-Store refresh tokens in encrypted cookie.
-
---- GIT DIFF ---
-{output}"#
-    )
-}
-
 fn cut_the_prompt(prompt: &str) -> (String, String) {
 	let mut lines = prompt.lines();
 	let title = lines.next().unwrap_or("").to_string();
@@ -147,46 +186,52 @@ fn cut_the_prompt(prompt: &str) -> (String, String) {
 
 #[tokio::main]
 async fn main() {
-	let diff;
-	let mut output = String::new();
-	let readmes;
-
 	Command::new("git")
 		.args(&["add", "."])
 		.output()
 		.expect("Failed to execute git add command");
 
-	diff = get_the_diff_for_github();
-	match &diff {
-		Ok(diff) => {
-			output.push_str("The following changes were detected between the last two commits:\n\n");
-			output.push_str(&diff);
-		}
+	let diff = match get_the_diff_for_github() {
+		Ok(d) => d,
 		Err(e) => {
 			eprintln!("Error: {}", e);
+			return;
 		}
-	}
-	if diff.is_ok() {
-		readmes = get_all_the_readmes();
-		match readmes {
-			Ok(readmes) if !readmes.is_empty() => {
-				output.push_str("\n\nThe following Readme files were found:\n\n");
-				output.push_str(&readmes);
-			}
-			Ok(_) => {
-				println!("No README.md files found.");
-			}
-			Err(e) => {
-				eprintln!("Error: {}", e);
-			}
-		}
-	}
-	let prompt = prepare_the_prompt(&output);
-	if prompt.is_empty() {
-		eprintln!("Failed to prepare the prompt.");
-	}
+	};
 
-	let prompt_result = ask_claude(&output, &get_api_key()).await;
+	let readmes = get_all_the_readmes().unwrap_or_default();
+
+	let api_key = get_api_key();
+
+	let chunks = split_diff_into_chunks(&diff);
+	let context = if chunks.len() == 1 {
+		println!("Generating commit message...");
+		let mut ctx = String::new();
+		ctx.push_str(&diff);
+		if !readmes.is_empty() {
+			ctx.push_str("\n\n--- README CONTEXT ---\n");
+			ctx.push_str(&readmes);
+		}
+		ctx
+	} else {
+		println!("Diff is large ({} chars), splitting into {} chunks...", diff.len(), chunks.len());
+		let mut summaries = Vec::new();
+		for (i, chunk) in chunks.iter().enumerate() {
+			let summary = summarize_chunk(chunk, i, chunks.len(), &api_key).await;
+			summaries.push(summary);
+		}
+		let mut ctx = String::from("Summaries of all changes:\n\n");
+		for (i, summary) in summaries.iter().enumerate() {
+			ctx.push_str(&format!("--- Part {}/{} ---\n{}\n\n", i + 1, summaries.len(), summary));
+		}
+		if !readmes.is_empty() {
+			ctx.push_str("--- README CONTEXT ---\n");
+			ctx.push_str(&readmes);
+		}
+		ctx
+	};
+
+	let prompt_result = generate_commit_message(&context, &api_key).await;
 
 	let (title, body) = cut_the_prompt(&prompt_result);
 	println!("Generated commit message:\n{}\n{}", title, body);
