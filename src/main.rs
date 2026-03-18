@@ -13,23 +13,47 @@ async fn call_claude(system: &str, user_message: &str, max_tokens: u32, api_key:
         "messages": [{ "role": "user", "content": user_message }]
     });
 
-    let res: serde_json::Value = reqwest::Client::new()
-        .post("https://api.anthropic.com/v1/messages")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await.unwrap()
-        .json()
-        .await.unwrap();
+    let client = reqwest::Client::new();
+    let max_retries = 3;
+    let mut delay_secs = 10;
 
-    match res["content"][0]["text"].as_str() {
-        Some(text) => text.to_string(),
-        None => {
-            eprintln!("API error: {}", res);
-            std::process::exit(1);
+    for attempt in 0..=max_retries {
+        let resp = client
+            .post("https://api.anthropic.com/v1/messages")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+
+        let status = resp.status();
+        let res: serde_json::Value = resp.json().await.unwrap();
+
+        if let Some(text) = res["content"][0]["text"].as_str() {
+            return text.to_string();
         }
+
+        let is_rate_limit = status == 429
+            || res["error"]["type"].as_str() == Some("rate_limit_error");
+
+        if is_rate_limit && attempt < max_retries {
+            eprintln!(
+                "Rate limited, retrying in {}s... (attempt {}/{})",
+                delay_secs,
+                attempt + 1,
+                max_retries
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            delay_secs *= 2;
+            continue;
+        }
+
+        eprintln!("API error: {}", res);
+        std::process::exit(1);
     }
+
+    unreachable!()
 }
 
 fn split_diff_into_chunks(diff: &str) -> Vec<String> {
@@ -156,18 +180,31 @@ fn get_the_diff_for_github() -> Result<String, String> {
 	Ok(diff)
 }
 
+const MAX_README_CHARS: usize = 2_000;
+
 fn get_all_the_readmes() -> Result<String, String> {
 	let mut readmes = String::new();
+	let mut total_chars = 0;
 	for entry in glob("**/README*.md").unwrap().flatten() {
 		let path = entry;
+		let content = fs::read_to_string(&path)
+			.map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
 		readmes.push_str("readme name is: \t");
 		readmes.push_str(path.file_name().unwrap().to_string_lossy().as_ref());
 		readmes.push_str("\n\n");
-		let content = fs::read_to_string(&path)
-			.map_err(|e| format!("Failed to read file {}: {}", path.display(), e))?;
 		readmes.push_str("content is: \n");
-		readmes.push_str(&content);
+		let remaining = MAX_README_CHARS.saturating_sub(total_chars);
+		if remaining == 0 {
+			readmes.push_str("[truncated]\n\n");
+			break;
+		}
+		let truncated = &content[..content.len().min(remaining)];
+		readmes.push_str(truncated);
+		if content.len() > remaining {
+			readmes.push_str("\n[truncated]");
+		}
 		readmes.push_str("\n\n");
+		total_chars += truncated.len();
 	}
 	Ok(readmes)
 }
